@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	fzfCommand = "fzf"
+	fzfCommand   = "fzf"
+	ctxActiveEnv = "CTX_ACTIVE"
 )
 
 type Environment struct {
@@ -30,6 +31,7 @@ type Context struct {
 	ID           string         `hcl:",label"`
 	Prompt       *string        `hcl:"prompt"`
 	Environments []*Environment `hcl:"env,block"`
+	SubContexts  []*Context     `hcl:"context,block"`
 }
 
 type Config struct {
@@ -37,7 +39,38 @@ type Config struct {
 	Contexts []*Context `hcl:"context,block"`
 }
 
+func lookup(cfg *Config, path string) *Context {
+	if path == "" {
+		return nil
+	}
+
+	var current *Context
+	parts := strings.Split(path, ",")
+	parent := cfg.Contexts
+
+	for _, p := range parts {
+
+		found := false
+		for _, c := range parent {
+			if p == c.ID {
+				parent = c.SubContexts
+				current = c
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return nil
+		}
+	}
+
+	return current
+}
+
 func main() {
+	var err error
+
 	var configFile string
 	var help bool
 
@@ -51,7 +84,7 @@ func main() {
 		fmt.Println()
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err = fs.Parse(os.Args[1:]); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
@@ -61,38 +94,14 @@ func main() {
 		os.Exit(0)
 	}
 
-	if configFile == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
+	var config Config
+
+	if fs.NArg() == 0 {
+		if err = parseConfig(configFile, &config); err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		configFile = filepath.Join(home, ".ctx.hcl")
-	}
 
-	if _, err := os.Stat(configFile); err != nil {
-		fmt.Println(err)
-		fmt.Println("if config file not found try `ctx edit` to create it first")
-		os.Exit(1)
-	}
-
-	parser := hclparse.NewParser()
-	f, diag := parser.ParseHCLFile(configFile)
-	if diag != nil && diag.HasErrors() {
-		fmt.Println(diag.Error())
-		os.Exit(1)
-	}
-
-	var config Config
-	diag = gohcl.DecodeBody(f.Body, nil, &config)
-	if diag != nil && diag.HasErrors() {
-		fmt.Println(diag.Error())
-		os.Exit(1)
-	}
-
-	var err error
-
-	if fs.NArg() == 0 {
 		err = handleSet(&config, "")
 	} else {
 		switch fs.Arg(0) {
@@ -107,12 +116,33 @@ func main() {
 				os.Exit(1)
 			}
 
+			if err = parseConfig(configFile, &config); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+
 			err = handleSet(&config, ctxid)
 		case "prompt":
-			err = handlePrompt(&config)
+			if err = parseConfig(configFile, &config); err != nil {
+				os.Exit(0)
+			}
+
+			err = nil
+			handlePrompt(&config)
 		case "list":
-			err = handleList(&config)
+			if err = parseConfig(configFile, &config); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+
+			err = nil
+			handleList(&config)
 		case "edit":
+			if err = parseConfig(configFile, &config); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+
 			err = handleEdit(configFile)
 		case "help":
 			fs.Usage()
@@ -132,11 +162,6 @@ func main() {
 }
 
 func handleSet(config *Config, ctxid string) error {
-	active := os.Getenv("CTX_ACTIVE")
-	if active != "" {
-		return fmt.Errorf("an active context is running, leave it first: %s", active)
-	}
-
 	if ctxid == "" {
 		var err error
 		ctxid, err = executeAndReturn([]string{
@@ -148,7 +173,19 @@ func handleSet(config *Config, ctxid string) error {
 		}
 	}
 
-	for _, c := range config.Contexts {
+	var parent = config.Contexts
+
+	active := os.Getenv(ctxActiveEnv)
+	if active != "" {
+		ctx := lookup(config, active)
+		if ctx == nil {
+			return errors.New("internal error, current context not found")
+		}
+
+		parent = ctx.SubContexts
+	}
+
+	for _, c := range parent {
 		if c.ID == ctxid {
 			return switchContext(config, c)
 		}
@@ -157,28 +194,38 @@ func handleSet(config *Config, ctxid string) error {
 	return fmt.Errorf("context %s not found", ctxid)
 }
 
-func handlePrompt(config *Config) error {
-	active := os.Getenv("CTX_ACTIVE")
+func handlePrompt(config *Config) {
+	active := os.Getenv(ctxActiveEnv)
 	if active == "" {
-		return nil
+		return
 	}
 
-	for _, c := range config.Contexts {
-		if c.ID == active {
-			if c.Prompt != nil {
-				fmt.Print(*c.Prompt)
-			}
-		}
+	c := lookup(config, active)
+	if c == nil {
+		return
 	}
 
-	return nil
+	if c.Prompt != nil {
+		fmt.Print(*c.Prompt)
+	}
 }
 
-func handleList(config *Config) error {
-	for _, c := range config.Contexts {
+func handleList(config *Config) {
+	var parent = config.Contexts
+
+	active := os.Getenv(ctxActiveEnv)
+	if active != "" {
+		ctx := lookup(config, active)
+		if ctx == nil {
+			return
+		}
+
+		parent = ctx.SubContexts
+	}
+
+	for _, c := range parent {
 		fmt.Println(c.ID)
 	}
-	return nil
 }
 
 func handleEdit(configFile string) error {
@@ -197,7 +244,16 @@ func generateEnvironment(context *Context, additionalEnvs []string) ([]string, e
 		environmentVariables = append(environmentVariables, fmt.Sprintf("%s=%s", e.ID, val))
 	}
 	environmentVariables = append(environmentVariables, additionalEnvs...)
-	environmentVariables = append(environmentVariables, fmt.Sprintf("CTX_ACTIVE=%s", context.ID))
+
+	active := os.Getenv("CTX_ACTIVE")
+	if active != "" {
+		environmentVariables = append(environmentVariables,
+			fmt.Sprintf("CTX_ACTIVE=%s,%s", active, context.ID))
+	} else {
+		environmentVariables = append(environmentVariables,
+			fmt.Sprintf("CTX_ACTIVE=%s", context.ID))
+	}
+
 	return environmentVariables, nil
 }
 
@@ -290,4 +346,31 @@ func resolveEnvironment(e *Environment) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown environment resolution type: %s", resolvType)
 	}
+}
+
+func parseConfig(configFile string, config *Config) error {
+	if configFile == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		configFile = filepath.Join(home, ".ctx.hcl")
+	}
+
+	if _, err := os.Stat(configFile); err != nil {
+		return err
+	}
+
+	parser := hclparse.NewParser()
+	f, diag := parser.ParseHCLFile(configFile)
+	if diag != nil && diag.HasErrors() {
+		return diag
+	}
+
+	diag = gohcl.DecodeBody(f.Body, nil, config)
+	if diag != nil && diag.HasErrors() {
+		return diag
+	}
+
+	return nil
 }
