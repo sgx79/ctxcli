@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclparse"
-	shellwords "github.com/mattn/go-shellwords"
+	"github.com/mattn/go-shellwords"
 )
 
 const (
@@ -78,7 +77,7 @@ func main() {
 	fs.StringVar(&configFile, "config", os.Getenv("CTX_CONFIG"), "")
 	fs.BoolVar(&help, "help", false, "")
 	fs.Usage = func() {
-		fmt.Println("usage: ctx [set <argment> | prompt | list | edit | help]")
+		fmt.Println("usage: ctx [set <argment> | prompt | list | edit | dump | help]")
 		fmt.Println()
 		fmt.Println("  if", fzfCommand, "is installed, no argument is need to set context")
 		fmt.Println()
@@ -106,11 +105,12 @@ func main() {
 	} else {
 		switch fs.Arg(0) {
 		case "set":
-			var ctxid string
+			var ctxId string
 			switch fs.NArg() {
 			case 0:
 			case 1:
-				ctxid = fs.Arg(1)
+			case 2:
+				ctxId = fs.Arg(1)
 			default:
 				fmt.Println("set only accept 1 argument")
 				os.Exit(1)
@@ -121,7 +121,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			err = handleSet(&config, ctxid)
+			err = handleSet(&config, ctxId)
 		case "prompt":
 			if err = parseConfig(configFile, &config); err != nil {
 				os.Exit(0)
@@ -137,6 +137,19 @@ func main() {
 
 			err = nil
 			handleList(&config)
+		case "dump":
+			if err = parseConfig(configFile, &config); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+
+			var buf []byte
+			if buf, err = os.ReadFile(configFile); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+
+			fmt.Println(string(buf))
 		case "edit":
 			if err = parseConfig(configFile, &config); err != nil {
 				fmt.Println(err)
@@ -148,8 +161,14 @@ func main() {
 			fs.Usage()
 			os.Exit(0)
 		default:
-			fmt.Println("unknown command")
-			os.Exit(1)
+			ctxId := fs.Arg(0)
+
+			if err = parseConfig(configFile, &config); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+
+			err = handleSet(&config, ctxId)
 		}
 	}
 
@@ -317,18 +336,18 @@ func execute(args, envs []string) error {
 }
 
 func resolveEnvironment(e *Environment) (string, error) {
-	var resolvType string
+	var resolveType string
 	if e.Type == nil {
-		resolvType = "static"
+		resolveType = "static"
 	} else {
-		resolvType = *e.Type
+		resolveType = *e.Type
 	}
 
-	switch resolvType {
+	switch resolveType {
 	case "static":
 		return e.Source, nil
 	case "file":
-		content, err := ioutil.ReadFile(e.Source)
+		content, err := os.ReadFile(e.Source)
 		if err != nil {
 			return "", err
 		}
@@ -344,7 +363,7 @@ func resolveEnvironment(e *Environment) (string, error) {
 		}
 		return content, nil
 	default:
-		return "", fmt.Errorf("unknown environment resolution type: %s", resolvType)
+		return "", fmt.Errorf("unknown environment resolution type: %s", resolveType)
 	}
 }
 
