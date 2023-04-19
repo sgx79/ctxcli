@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -72,104 +71,123 @@ func main() {
 
 	var configFile string
 	var help bool
+	var command string
+	var restArgs []string
+	var contextId string
 
-	fs := flag.NewFlagSet("ctx", flag.ExitOnError)
-	fs.StringVar(&configFile, "config", os.Getenv("CTX_CONFIG"), "")
-	fs.BoolVar(&help, "help", false, "")
-	fs.Usage = func() {
+	allIsRest := false
+	expectContext := false
+	hideBinArgs := os.Args[1:]
+
+	for i := 0; i < len(hideBinArgs); i++ {
+		if help {
+			break
+		}
+
+		if allIsRest {
+			restArgs = append(restArgs, hideBinArgs[i])
+			continue
+		}
+
+		if expectContext {
+			contextId = hideBinArgs[i]
+			expectContext = false
+			continue
+		}
+
+		switch hideBinArgs[i] {
+		case "-config", "--config":
+			i++
+			configFile = hideBinArgs[i]
+		case "--":
+			allIsRest = true
+		case "-help", "--help":
+			help = true
+		case "set", "exec":
+			expectContext = true
+			fallthrough
+		case "prompt", "list", "dump", "edit":
+			if command == "" {
+				command = hideBinArgs[i]
+				continue
+			}
+			fallthrough
+		default:
+			restArgs = append(restArgs, hideBinArgs[i])
+		}
+	}
+
+	if help {
 		fmt.Println("usage: ctx [set <argment> | prompt | list | edit | dump | help]")
 		fmt.Println()
 		fmt.Println("  if", fzfCommand, "is installed, no argument is need to set context")
 		fmt.Println()
-		fs.PrintDefaults()
-	}
-	if err = fs.Parse(os.Args[1:]); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		os.Exit(0)
 	}
 
-	if help {
-		fs.Usage()
-		os.Exit(0)
+	if configFile == "" {
+		configFile = os.Getenv("CTX_CONFIG")
+	}
+
+	if command == "" {
+		command = "set"
 	}
 
 	var config Config
 
-	if fs.NArg() == 0 {
+	switch command {
+	case "set":
+		if err = parseConfig(configFile, &config); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		err = handleSet(&config, contextId)
+	case "exec":
 		if err = parseConfig(configFile, &config); err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
 
-		err = handleSet(&config, "")
-	} else {
-		switch fs.Arg(0) {
-		case "set":
-			var ctxId string
-			switch fs.NArg() {
-			case 0:
-			case 1:
-			case 2:
-				ctxId = fs.Arg(1)
-			default:
-				fmt.Println("set only accept 1 argument")
-				os.Exit(1)
-			}
-
-			if err = parseConfig(configFile, &config); err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			err = handleSet(&config, ctxId)
-		case "prompt":
-			if err = parseConfig(configFile, &config); err != nil {
-				os.Exit(0)
-			}
-
-			err = nil
-			handlePrompt(&config)
-		case "list":
-			if err = parseConfig(configFile, &config); err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			err = nil
-			handleList(&config)
-		case "dump":
-			if err = parseConfig(configFile, &config); err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			var buf []byte
-			if buf, err = os.ReadFile(configFile); err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			fmt.Println(string(buf))
-		case "edit":
-			if err = parseConfig(configFile, &config); err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			err = handleEdit(configFile)
-		case "help":
-			fs.Usage()
-			os.Exit(0)
-		default:
-			ctxId := fs.Arg(0)
-
-			if err = parseConfig(configFile, &config); err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			err = handleSet(&config, ctxId)
+		if len(restArgs) == 0 {
+			err = errors.New("what command should execute")
+		} else {
+			err = handleExec(&config, contextId, restArgs)
 		}
+	case "prompt":
+		if err = parseConfig(configFile, &config); err != nil {
+			os.Exit(0)
+		}
+
+		err = nil
+		handlePrompt(&config)
+	case "list":
+		if err = parseConfig(configFile, &config); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		err = nil
+		handleList(&config)
+	case "dump":
+		if err = parseConfig(configFile, &config); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		var buf []byte
+		if buf, err = os.ReadFile(configFile); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		fmt.Println(string(buf))
+	case "edit":
+		if err = parseConfig(configFile, &config); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		err = handleEdit(configFile)
 	}
 
 	if err != nil {
@@ -178,6 +196,38 @@ func main() {
 	}
 
 	os.Exit(0)
+}
+
+func handleExec(config *Config, ctxid string, args []string) error {
+	var parent = config.Contexts
+
+	active := os.Getenv(ctxActiveEnv)
+	if active != "" {
+		ctx := lookup(config, active)
+		if ctx == nil {
+			return errors.New("internal error, current context not found")
+		}
+
+		parent = ctx.SubContexts
+	}
+
+	for _, c := range parent {
+		if c.ID == ctxid {
+			environmentVariables, err := generateEnvironment(c, []string{})
+			if err != nil {
+				return err
+			}
+
+			cmd := exec.Command(args[0], args[1:]...)
+			cmd.Env = environmentVariables
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			return cmd.Run()
+		}
+	}
+
+	return fmt.Errorf("context %s not found", ctxid)
 }
 
 func handleSet(config *Config, ctxid string) error {
