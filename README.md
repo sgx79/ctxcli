@@ -6,7 +6,7 @@ environment
 commands
 ========
 
-- ctx set [ <**context**> ]
+- ctx [ set ] [ <**context**> ]
 - ctx prompt 
 - ctx list
 - ctx edit
@@ -44,4 +44,16 @@ __update_ps1() {
 }
 
 export PROMPT_COMMAND=__update_ps1
+```
+
+auto complete
+=============
+
+```bash
+_ctx()
+{
+    local cmd=$1 cur=$2 pre=$3
+    mapfile -t COMPREPLY < <( ctx list | grep "$cur" )
+}
+complete -F _ctx -o nospace ctx
 ```
